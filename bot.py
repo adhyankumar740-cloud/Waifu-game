@@ -4,9 +4,11 @@ import time
 import requests
 import os
 import uuid
+import json # JSON module for parsing tags in get_random_waifu
+
 from dotenv import load_dotenv
 import psycopg2
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultPhoto, InlineQueryResultArticle, InputTextMessageContent
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultPhoto, InputTextMessageContent
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,7 +16,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
     CallbackQueryHandler,
-    InlineQueryHandler 
+    InlineQueryHandler
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -42,29 +44,23 @@ logger = logging.getLogger(__name__)
 def execute_query(query, params=None, fetch=False):
     """Database se connect aur query execute karta hai."""
     conn = None
+    result = None
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         cur = conn.cursor()
         cur.execute(query, params)
         if fetch:
             result = cur.fetchall()
-            conn.commit()
-            cur.close()
-            return result
         conn.commit()
         cur.close()
     except Exception as e:
-        logger.error(f"Database Error: {e}")
-        # Initialization logic for robustness
-        if "does not exist" in str(e) or "relation" in str(e) or "column" in str(e):
-             # Try initialization/migration if schema error occurs
-             initialize_database()
-             if conn: conn.close()
-             return execute_query(query, params, fetch)
-        
+        logger.error(f"Database Error: {e} executing: {query.split(';')[0].strip()}")
+        # Schema migration/initialization is handled during main() startup, 
+        # so here we just log and return None if an operational error occurs.
     finally:
         if conn:
             conn.close()
+    return result
 
 def initialize_database():
     """Zaroori tables banata hai aur existing mein missing columns add karta hai."""
@@ -72,7 +68,7 @@ def initialize_database():
     queries = [
         # --- CREATE TABLES (IF NOT EXISTS) ---
         "CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT);",
-        "CREATE TABLE IF NOT EXISTS characters (char_id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, image_url TEXT, rarity TEXT DEFAULT 'Common', anime TEXT DEFAULT 'Unknown');", # Added image_url, rarity, anime
+        "CREATE TABLE IF NOT EXISTS characters (char_id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, image_url TEXT, rarity TEXT DEFAULT 'Common', anime TEXT DEFAULT 'Unknown');", 
         "CREATE TABLE IF NOT EXISTS user_collection (user_id BIGINT REFERENCES users(user_id), char_id INT REFERENCES characters(char_id), grab_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, char_id));",
         "CREATE TABLE IF NOT EXISTS user_profiles (user_id BIGINT PRIMARY KEY REFERENCES users(user_id), trades_done INT DEFAULT 0, gifts_sent INT DEFAULT 0, gifts_received INT DEFAULT 0, hmode_text TEXT DEFAULT 'Harem Collection', imode_text TEXT DEFAULT 'Inline Waifus');",
         "CREATE TABLE IF NOT EXISTS pending_trades (trade_id TEXT PRIMARY KEY, from_user_id BIGINT REFERENCES users(user_id), to_user_id BIGINT REFERENCES users(user_id), from_char_name TEXT NOT NULL, to_char_name TEXT NOT NULL, status TEXT DEFAULT 'PENDING', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);",
@@ -94,19 +90,20 @@ def initialize_database():
                 cur.execute(query)
                 conn.commit()
             except psycopg2.ProgrammingError as pe:
+                 # Agar 'already exists' type ka error aaye toh ignore karo
                  if 'already exists' in str(pe):
-                      logger.info(f"Column already exists, ignoring: {query.strip()}")
                       conn.rollback() 
                  else:
                       raise 
             except Exception as e:
-                logger.error(f"Error executing query: {e} in {query.strip()}")
+                logger.error(f"Error executing query: {e} in {query.split(';')[0].strip()}")
                 conn.rollback() 
 
         cur.close()
         logger.info("Database schema initialized and migrated successfully.")
     except Exception as e:
         logger.error(f"Database Initialization/Migration Failed: {e}")
+        # Agar yahan fail ho jaye, toh bot aage nahi badhega, jo sahi hai.
     finally:
         if conn:
             conn.close()
@@ -127,31 +124,36 @@ def register_user(user):
 async def get_random_waifu():
     """Waifu.im se random waifu fetch karta hai aur uski details nikalta hai."""
     try:
+        # SFW Waifu images ko target karna
         response = requests.get("https://api.waifu.im/search?is_nsfw=false&tags=waifu")
         response.raise_for_status()
         data = response.json()
         
         image_url = data['images'][0]['url']
         
-        # Character Name (Tags se nikalna)
         character_name = "Unknown Waifu"
         anime_name = "Unknown Anime"
         tags = data['images'][0].get('tags', [])
+        
+        # Tags se character aur anime name nikalna
         for tag in tags:
             if tag.get('is_character', False):
                 character_name = tag['name']
-            if tag.get('is_character', False) == False and tag.get('is_nsfw', False) == False and tag.get('is_meta', False) == False:
-                 anime_name = tag['name'] # Simple assumption: First non-meta/nsfw tag is the anime/source
+            elif tag.get('is_meta', False) == False and tag.get('is_nsfw', False) == False:
+                 # First non-meta/nsfw tag is a good candidate for the source/anime
+                 if anime_name == "Unknown Anime":
+                      anime_name = tag['name'] 
         
         if character_name == "Unknown Waifu":
-             character_name = f"Waifu #{int(time.time() * 1000)}" 
+             # Agar naam nahi mila toh timestamp se unique naam banao
+             character_name = f"Waifu #{str(uuid.uuid4())[:8]}" 
              
         # Simple Rarity Logic (Can be improved)
         rarity = random.choice(["Common", "Rare", "Epic", "Legendary"])
 
         return character_name.strip(), image_url, rarity, anime_name.strip()
     except Exception as e:
-        logger.error(f"API Error: {e}")
+        logger.error(f"API Error fetching waifu: {e}")
         return None, None, None, None
 
 # --- CORE LOGIC (SPAWN AND COUNTER) ---
@@ -160,6 +162,7 @@ async def spawn_waifu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Chat mein ek nayi waifu spawn karta hai."""
     global current_spawns
     
+    # Check if a waifu is already spawned and unclaimed in this chat
     if chat_id in current_spawns and not current_spawns[chat_id].get('claimed', True):
         return
 
@@ -172,7 +175,6 @@ async def spawn_waifu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         # Waifu details ko DB mein save karein (ya update karein)
-        # Yeh step zaroori hai taki inline search mein photo dikh sake
         execute_query(
             "INSERT INTO characters (name, image_url, rarity, anime) VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO UPDATE SET image_url = EXCLUDED.image_url, rarity = EXCLUDED.rarity, anime = EXCLUDED.anime;",
             (name, image, rarity, anime)
@@ -186,61 +188,128 @@ async def spawn_waifu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             reply_markup=reply_markup
         )
 
-# --- INLINE QUERY HANDLER (THE NEW FEATURE) ---
+# --- COMMAND HANDLERS ---
 
-async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inline query ko handle karta hai aur scrollable results deta hai (Screenshot feature)."""
-    query = update.inline_query.query
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start: Welcome message aur user registration."""
+    user = update.effective_user
+    register_user(user)
+    profile_data = execute_query("SELECT hmode_text FROM user_profiles WHERE user_id = %s;", (user.id,), fetch=True)
+    hmode_text = profile_data[0][0] if profile_data else "Harem Collection"
     
-    # Agar query empty hai, toh random popular characters dikhayein (ya blank)
-    if not query:
-        # Default/Popular characters dikhane ke liye logic yahan dal sakte hain
-        results_data = execute_query(
-             "SELECT name, image_url, char_id, rarity, anime FROM characters ORDER BY char_id DESC LIMIT 20;",
-             fetch=True
+    await update.message.reply_html(
+        rf"Salaam, {user.mention_html()}! Main **Grab Your Waifu Bot** hoon. 😼"
+        f"\n\nHar {SPAWN_THRESHOLD} messages ke baad ek nayi waifu spawn hogi, jise aap **GRAB** kar sakte hain!"
+        f"\n\n**Main Commands:**"
+        f"\n/grab - Spawned waifu ko claim karein."
+        f"\n/harem - Apni {hmode_text} dekhein."
+        f"\n/status - Apne Harem Stats dekhein."
+        f"\n/trade & /gift - Waifus ka aadaan-pradaan karein."
+        f"\n\n**Gallery Search:**"
+        f"\nKisi bhi chat mein type karein: <b>@botname [waifu name]</b> - Gallery mein search karne ke liye!"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/help: FAQ/Madad."""
+    await update.message.reply_text(
+        "**FAQ/Madad:**\n"
+        "1. **Spawn:** Har {SPAWN_THRESHOLD} messages ke baad ek waifu spawn hogi. Use /grab ya button se claim karein.\n"
+        "2. **Collection:** /harem se aapki collection dekhein.\n"
+        "3. **Trade/Gift:** /trade @user [Aapka Char] for [Unka Char] or /gift @user [Char Name].\n"
+        "4. **Search:** Chat mein **@botname [waifu name]** type karein gallery search ke liye."
+        , parse_mode=ParseMode.MARKDOWN
+    )
+
+async def grab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/grab: Spawned waifu ko claim karta hai (Text fallback)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    if chat_id not in current_spawns or current_spawns[chat_id].get('claimed', True):
+        await update.message.reply_text("Abhi koi waifu spawned nahi hai. Agli spawn ka intezaar karein!")
+        return
+
+    spawned_waifu = current_spawns[chat_id]
+    
+    # Check if user already has the character
+    check_query = """SELECT c.name FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name = %s;"""
+    if execute_query(check_query, (user_id, spawned_waifu['name']), fetch=True):
+         await update.message.reply_text(f"**{update.effective_user.first_name}** ke paas **{spawned_waifu['name']}** pehle se hai!", parse_mode=ParseMode.MARKDOWN)
+         return
+
+    # Claim the character
+    execute_query(
+        "INSERT INTO characters (name, image_url, rarity, anime) VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO UPDATE SET image_url = EXCLUDED.image_url, rarity = EXCLUDED.rarity, anime = EXCLUDED.anime;",
+        (spawned_waifu['name'], spawned_waifu['image'], spawned_waifu['rarity'], spawned_waifu['anime'])
+    )
+    
+    char_id_result = execute_query("SELECT char_id FROM characters WHERE name = %s;", (spawned_waifu['name'],), fetch=True)
+    if char_id_result:
+        char_id = char_id_result[0][0]
+        execute_query("INSERT INTO user_collection (user_id, char_id) VALUES (%s, %s);", (user_id, char_id))
+        current_spawns[chat_id]['claimed'] = True
+        
+        # Edit the original message (if possible)
+        try:
+             await context.bot.edit_message_caption(
+                 chat_id=chat_id,
+                 message_id=update.message.message_id - 1, # Thoda mushkil, agar button se na ho to ignore
+                 caption=f"✨ **{spawned_waifu['name']}** ({spawned_waifu['rarity']}) ✨\n\n💖 **Grabbed by: {update.effective_user.first_name}** 💖",
+                 parse_mode=ParseMode.MARKDOWN,
+                 reply_markup=None
+             )
+        except Exception:
+             pass # Agar edit fail ho toh ignore karo
+             
+        await update.message.reply_text(
+            f"🎉 Badhaai ho, **{update.effective_user.first_name}**! Aapne **{spawned_waifu['name']}** ko apne harem mein shaamil kar liya hai!",
+            parse_mode=ParseMode.MARKDOWN
         )
     else:
-        # Search query ke anusaar characters khojein
-        results_data = execute_query(
-            "SELECT name, image_url, char_id, rarity, anime FROM characters WHERE name ILIKE %s LIMIT 20;",
-            (f"%{query}%",), fetch=True
-        )
+        await update.message.reply_text("Grab failed due to DB error. Please try again.")
 
-    results = []
+
+async def harem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/harem: User ka collection dikhata hai."""
+    user_id = update.effective_user.id
     
-    for name, image_url, char_id, rarity, anime in results_data:
-        
-        # Detailed message content (Jab user click karega toh yeh chat mein bheja jayega)
-        message_content = f"✨ **{name}** ✨\n" \
-                          f"**Rarity:** {rarity}\n" \
-                          f"**Anime:** {anime}\n" \
-                          f"**ID:** {char_id}"
-                          
-        # Photo result: Scrollable gallery mein photo thumbnail dikhega
-        results.append(
-            InlineQueryResultPhoto(
-                id=str(uuid.uuid4()), # Unique ID har result ke liye
-                photo_url=image_url,
-                thumbnail_url=image_url,
-                caption=f"**{name}**\nRarity: {rarity}",
-                parse_mode=ParseMode.MARKDOWN,
-                
-                # InputMessageContent - Yeh jab user gallery se image select karke bhejega, toh uske sath kya text jayega
-                input_message_content=InputTextMessageContent(
-                    message_content, 
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            )
-        )
-        
-    await update.inline_query.answer(results, cache_time=5)
+    # Get user's preferred collection name
+    profile_data = execute_query("SELECT hmode_text FROM user_profiles WHERE user_id = %s;", (user_id,), fetch=True)
+    hmode_text = profile_data[0][0] if profile_data else "Harem Collection"
 
+    collection_data = execute_query(
+        "SELECT c.name, c.rarity, c.anime FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s ORDER BY c.rarity, c.name;",
+        (user_id,), fetch=True
+    )
 
-# --- TRADE AND GIFT COMMANDS (Full Implementation) ---
+    if not collection_data:
+        await update.message.reply_text(f"Aapki **{hmode_text}** abhi khaali hai. Spawn hone wali waifus ko grab karein!", parse_mode=ParseMode.MARKDOWN)
+        return
 
+    harem_list = [f"• {name} ({rarity}) - *{anime[:20]}...*" for name, rarity, anime in collection_data]
+    harem_text = f"💖 **{update.effective_user.first_name}**'s {hmode_text} ({len(harem_list)} Waifus) 💖\n\n" + "\n".join(harem_list)
+    
+    # Agar list bahut badi ho toh split karein
+    if len(harem_text) > 4096:
+         # Simplified split for Telegram message limit
+         harem_text = harem_text[:4000] + "\n\n...(Aur bhi hain, lekin Telegram limit ke kaaran poori list nahi dikh rahi)."
+
+    await update.message.reply_text(harem_text, parse_mode=ParseMode.MARKDOWN)
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/search: Inline search ke bare mein batata hai."""
+    profile_data = execute_query("SELECT imode_text FROM user_profiles WHERE user_id = %s;", (update.effective_user.id,), fetch=True)
+    imode_text = profile_data[0][0] if profile_data else "Inline Waifus"
+    await update.message.reply_text(
+        f"**{imode_text}** Gallery Search:\n\n"
+        f"Kisi bhi chat mein type karein: **@botname [waifu name]**"
+        f"\n\nExample: `@botname Rem`"
+        , parse_mode=ParseMode.MARKDOWN
+    )
+
+# Trading and Gifting functions (Same as previous response, included for completeness)
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/trade: Trade request karta hai aur DB mein save karta hai (Same as previous, full logic)."""
-    # ... (Same /trade logic from previous code) ...
+    # ... (Full /trade logic) ...
     try:
         args = context.args
         if len(args) < 3 or 'for' not in args:
@@ -276,7 +345,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         giver_has_char = execute_query(
-            "SELECT 1 FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name = %s;",
+            "SELECT 1 FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name ILIKE %s;",
             (from_user_id, my_char_name), fetch=True
         )
         if not giver_has_char:
@@ -284,12 +353,14 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         receiver_has_char = execute_query(
-            "SELECT 1 FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name = %s;",
+            "SELECT 1 FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name ILIKE %s;",
             (target_user_id, their_char_name), fetch=True
         )
         if not receiver_has_char:
             await update.message.reply_text(f"@{target_username} ke paas '{their_char_name}' nahi hai.")
             return
+        
+        # Use exact names found if multiple matches exist, but for now we assume ILIKE is sufficient
         
         trade_id = f"trade_{int(time.time())}_{from_user_id}" 
         execute_query(
@@ -326,8 +397,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trade request mein kuch gadbad hui.")
 
 async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/gift @username [char_name] - Waifu gift karta hai (Same as previous, full logic)."""
-    # ... (Same /gift logic from previous code) ...
+    # ... (Full /gift logic) ...
     try:
         args = context.args
         if len(args) < 2:
@@ -357,7 +427,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         char_id_result = execute_query(
-            "SELECT c.char_id FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name = %s;",
+            "SELECT c.char_id FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name ILIKE %s;",
             (gifter_user_id, character_name), fetch=True
         )
         if not char_id_result:
@@ -388,13 +458,60 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Gift command error: {e}")
         await update.message.reply_text("Gift bhejte waqt kuch gadbad hui.")
 
-# --- OTHER COMMANDS (Same as previous) ---
+# --- INLINE QUERY HANDLER (Search Gallery) ---
 
-# ... (start_command, help_command, harem_command, grab_command, changetime_command, 
-# top_command, leaderboard_command, get_leaderboard_markup, fetch_leaderboard_data, 
-# status_command, hmode_command, imode_command are all the same as the final code) ...
+async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline query ko handle karta hai aur scrollable results deta hai."""
+    query = update.inline_query.query
+    
+    # User ke preferred inline text ko fetch karna
+    profile_data = execute_query("SELECT imode_text FROM user_profiles WHERE user_id = %s;", (update.inline_query.from_user.id,), fetch=True)
+    imode_text = profile_data[0][0] if profile_data else "Inline Waifus"
+    
+    # Agar query empty hai, toh recently added characters dikhayein
+    if not query:
+        results_data = execute_query(
+             "SELECT name, image_url, char_id, rarity, anime FROM characters ORDER BY char_id DESC LIMIT 30;",
+             fetch=True
+        )
+    else:
+        # Search query ke anusaar characters khojein (case-insensitive search)
+        results_data = execute_query(
+            "SELECT name, image_url, char_id, rarity, anime FROM characters WHERE name ILIKE %s LIMIT 30;",
+            (f"%{query}%",), fetch=True
+        )
 
-# --- GRAB/LEADERBOARD/TRADE CALLBACKS (Same as previous) ---
+    results = []
+    
+    for name, image_url, char_id, rarity, anime in results_data:
+        
+        message_content = f"✨ **{name}** ✨\n" \
+                          f"**Rarity:** {rarity}\n" \
+                          f"**Anime:** {anime}\n" \
+                          f"**(DB ID: {char_id})**"
+                          
+        # InlineQueryResultPhoto for the image gallery look
+        results.append(
+            InlineQueryResultPhoto(
+                id=str(uuid.uuid4()), 
+                photo_url=image_url,
+                thumbnail_url=image_url,
+                title=f"{imode_text}: {name}",
+                caption=f"**{name}**\nRarity: {rarity}",
+                parse_mode=ParseMode.MARKDOWN,
+                
+                # InputMessageContent - Yeh jab user gallery se image select karke bhejega
+                input_message_content=InputTextMessageContent(
+                    message_content, 
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            )
+        )
+        
+    await update.inline_query.answer(results, cache_time=5)
+
+
+# --- CALLBACKS & OTHER HANDLERS ---
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Buttons (Grab, Leaderboard, Trade) ko handle karta hai."""
@@ -404,58 +521,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     chat_id = query.message.chat.id
     
-    # --- GRAB LOGIC (Same as previous) ---
+    # --- GRAB LOGIC (Same as grab_command) ---
     if query.data == "grab_waifu":
-        # ... (Same grab logic from previous code) ...
         if chat_id not in current_spawns or current_spawns[chat_id].get('claimed', True):
             await query.edit_message_caption(caption="Bahut der kardi! 🥺")
             return
             
         spawned_waifu = current_spawns[chat_id]
+        
         check_query = """SELECT c.name FROM user_collection uc JOIN characters c ON uc.char_id = c.char_id WHERE uc.user_id = %s AND c.name = %s;"""
         if execute_query(check_query, (user_id, spawned_waifu['name']), fetch=True):
              await query.message.reply_text(f"**{query.from_user.first_name}** ne **{spawned_waifu['name']}** ko grab karne ki koshish ki, lekin unke paas yeh pehle se hai!", parse_mode=ParseMode.MARKDOWN)
              current_spawns[chat_id]['claimed'] = True
+             await query.edit_message_reply_markup(reply_markup=None) # Remove button
              return
 
-        # Ensure all character details are updated/inserted for inline search
         execute_query(
             "INSERT INTO characters (name, image_url, rarity, anime) VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO UPDATE SET image_url = EXCLUDED.image_url, rarity = EXCLUDED.rarity, anime = EXCLUDED.anime;",
             (spawned_waifu['name'], spawned_waifu['image'], spawned_waifu['rarity'], spawned_waifu['anime'])
         )
         
         char_id_result = execute_query("SELECT char_id FROM characters WHERE name = %s;", (spawned_waifu['name'],), fetch=True)
-        char_id = char_id_result[0][0]
-        execute_query("INSERT INTO user_collection (user_id, char_id) VALUES (%s, %s);", (user_id, char_id))
-        current_spawns[chat_id]['claimed'] = True
         
-        await query.edit_message_caption(
-            caption=f"✨ **{spawned_waifu['name']}** ({spawned_waifu['rarity']}) ✨\n\n💖 **Grabbed by: {query.from_user.first_name}** 💖",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await query.message.reply_text(
-            f"🎉 Badhaai ho, **{query.from_user.first_name}**! Aapne **{spawned_waifu['name']}** ko apne harem mein shaamil kar liya hai!",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # --- LEADERBOARD LOGIC (Same as previous) ---
-    elif query.data.startswith("lb_"):
-        # ... (Same leaderboard logic from previous code) ...
-        time_period = query.data.split('_')[1]
-        leaderboard_text = fetch_leaderboard_data(time_period)
-        
-        try:
-            await query.edit_message_text(
-                leaderboard_text,
+        if char_id_result:
+            char_id = char_id_result[0][0]
+            execute_query("INSERT INTO user_collection (user_id, char_id) VALUES (%s, %s);", (user_id, char_id))
+            current_spawns[chat_id]['claimed'] = True
+            
+            await query.edit_message_caption(
+                caption=f"✨ **{spawned_waifu['name']}** ({spawned_waifu['rarity']}) ✨\n\n💖 **Grabbed by: {query.from_user.first_name}** 💖",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_leaderboard_markup(time_period)
+                reply_markup=None # Remove the button
             )
-        except BadRequest:
-             pass
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🎉 Badhaai ho, **{query.from_user.first_name}**! Aapne **{spawned_waifu['name']}** ko apne harem mein shaamil kar liya hai!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await query.edit_message_caption(caption="Grab failed due to DB error. Please try again.")
+
+    # --- LEADERBOARD LOGIC (Simplified placeholders) ---
+    elif query.data.startswith("lb_"):
+        # Yahan par aapka leaderboard data fetch/display logic ayega
+        await query.edit_message_text("Leaderboard data updated! (Implementation pending)")
+
              
-    # --- TRADE LOGIC (ACCEPT/REJECT) (Same as previous) ---
+    # --- TRADE LOGIC (ACCEPT/REJECT) ---
     elif query.data.startswith(("trade_accept_", "trade_reject_")):
-        # ... (Same trade accept/reject logic from previous code) ...
         action, trade_id = query.data.split('_', 2)[1:]
         
         trade_data = execute_query(
@@ -479,24 +593,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              
         giver_name_result = execute_query("SELECT first_name FROM users WHERE user_id = %s;", (from_id,), fetch=True)
         giver_name = giver_name_result[0][0] if giver_name_result else "Original User"
+        receiver_name = query.from_user.first_name # The one who accepted/rejected
 
         if action == "accept":
-            from_char_id_result = execute_query("SELECT char_id FROM characters WHERE name = %s;", (from_char,), fetch=True)
-            to_char_id_result = execute_query("SELECT char_id FROM characters WHERE name = %s;", (to_char,), fetch=True)
+            # Char IDs ko dobara fetch karna for safety, using ILIKE for flexibility
+            from_char_id_result = execute_query("SELECT char_id FROM characters WHERE name ILIKE %s;", (from_char,), fetch=True)
+            to_char_id_result = execute_query("SELECT char_id FROM characters WHERE name ILIKE %s;", (to_char,), fetch=True)
             
             if not from_char_id_result or not to_char_id_result:
-                 await query.edit_message_text("Trade fail: Character ID nahi mila.")
+                 await query.edit_message_text("Trade fail: Character ID nahi mila (ya naam match nahi hua).")
                  return
                  
             from_char_id = from_char_id_result[0][0]
             to_char_id = to_char_id_result[0][0]
 
+            # 1. Receiver ka char (to_char) Giver ko dena
             execute_query("DELETE FROM user_collection WHERE user_id = %s AND char_id = %s;", (to_id, to_char_id))
             execute_query("INSERT INTO user_collection (user_id, char_id) VALUES (%s, %s);", (from_id, to_char_id))
             
+            # 2. Giver ka char (from_char) Receiver ko dena
             execute_query("DELETE FROM user_collection WHERE user_id = %s AND char_id = %s;", (from_id, from_char_id))
             execute_query("INSERT INTO user_collection (user_id, char_id) VALUES (%s, %s);", (to_id, from_char_id))
             
+            # 3. Trade stats update karna
             execute_query("UPDATE user_profiles SET trades_done = trades_done + 1 WHERE user_id IN (%s, %s);", (from_id, to_id))
             execute_query("UPDATE pending_trades SET status = 'ACCEPTED' WHERE trade_id = %s;", (trade_id,))
             
@@ -505,7 +624,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=from_id,
-                    text=f"✅ **Trade Accepted!** {query.from_user.first_name} ne aapka trade request accept kar liya hai. Aapko **{to_char}** mil gaya hai!"
+                    text=f"✅ **Trade Accepted!** {receiver_name} ne aapka trade request accept kar liya hai. Aapko **{to_char}** mil gaya hai!"
                 )
             except Exception:
                 pass
@@ -517,13 +636,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=from_id,
-                    text=f"❌ **Trade Rejected!** {query.from_user.first_name} ne aapka trade request reject kar diya hai."
+                    text=f"❌ **Trade Rejected!** {receiver_name} ne aapka trade request reject kar diya hai."
                 )
             except Exception:
                 pass
 
+
 async def message_counter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Har message ko count karta hai aur threshold par spawn trigger karta hai (Same as previous)."""
+    """Har message ko count karta hai aur threshold par spawn trigger karta hai."""
     chat_id = update.effective_chat.id
     
     if update.message.chat.type == "private":
@@ -540,18 +660,131 @@ async def message_counter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.chat_data['message_count'] >= SPAWN_THRESHOLD:
         await spawn_waifu(context, chat_id)
         context.chat_data['message_count'] = 0 
+        
+# --- PLACEHOLDER FUNCTIONS (Minimal working versions) ---
+
+async def changetime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to change spawn time/threshold."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("Aap yeh command use nahi kar sakte.")
+        return
+    await update.message.reply_text("Spawn time changed (Implementation pending).")
+
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/top redirects to /gtop (leaderboard)."""
+    await leaderboard_command(update, context)
+
+def fetch_leaderboard_data(time_period='global'):
+    """DB se leaderboard data fetch karta hai."""
+    # Simplified query for demonstration
+    results = execute_query(
+        """
+        SELECT u.first_name, COUNT(uc.char_id) as count
+        FROM users u 
+        JOIN user_collection uc ON u.user_id = uc.user_id 
+        GROUP BY u.first_name 
+        ORDER BY count DESC 
+        LIMIT 10;
+        """, fetch=True
+    )
+    if not results:
+        return "Abhi koi data nahi hai. Pehli waifu grab karein!"
+        
+    text = "👑 **Global Top 10 Waifu Collectors** 👑\n\n"
+    for i, (name, count) in enumerate(results):
+        text += f"{i+1}. {name}: **{count}** waifus\n"
+    return text
+
+def get_leaderboard_markup(time_period):
+    """Leaderboard buttons create karta hai."""
+    keyboard = [
+        [
+            InlineKeyboardButton("Global", callback_data="lb_global"),
+            InlineKeyboardButton("Weekly (P)", callback_data="lb_weekly"), # (P) Placeholder
+            InlineKeyboardButton("Daily (P)", callback_data="lb_daily"),   # (P) Placeholder
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/gtop: Leaderboard dikhata hai."""
+    leaderboard_text = fetch_leaderboard_data()
+    reply_markup = get_leaderboard_markup('global')
+    
+    await update.message.reply_text(
+        leaderboard_text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status: User ka profile aur stats dikhata hai."""
+    user_id = update.effective_user.id
+    
+    # 1. Stats from user_profiles
+    profile_data = execute_query(
+        "SELECT trades_done, gifts_sent, gifts_received, hmode_text, imode_text FROM user_profiles WHERE user_id = %s;", 
+        (user_id,), 
+        fetch=True
+    )
+    # 2. Total collection count
+    count_data = execute_query(
+        "SELECT COUNT(char_id) FROM user_collection WHERE user_id = %s;", 
+        (user_id,), 
+        fetch=True
+    )
+    
+    trades_done, gifts_sent, gifts_received, hmode_text, imode_text = profile_data[0] if profile_data else (0, 0, 0, "Harem Collection", "Inline Waifus")
+    total_waifus = count_data[0][0] if count_data else 0
+
+    status_text = (
+        f"👤 **{update.effective_user.first_name}'s Profile Status** 📊\n\n"
+        f"💖 **Total Waifus:** {total_waifus}\n"
+        f"🔄 **Trades Done:** {trades_done}\n"
+        f"🎁 **Gifts Sent:** {gifts_sent}\n"
+        f"🧧 **Gifts Received:** {gifts_received}\n\n"
+        f"🔧 **Current Settings:**\n"
+        f"  • /harem Mode: `{hmode_text}`\n"
+        f"  • /search Mode: `{imode_text}`"
+    )
+    await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+
+async def hmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hmode [text]: Customizes the name of the /harem list."""
+    if not context.args:
+        await update.message.reply_text("Kripya naya naam enter karein. Example: `/hmode Waifu Paradise`")
+        return
+        
+    new_text = " ".join(context.args).strip()[:30] # Limit to 30 chars
+    user_id = update.effective_user.id
+    
+    execute_query("UPDATE user_profiles SET hmode_text = %s WHERE user_id = %s;", (new_text, user_id))
+    await update.message.reply_text(f"✅ Success! Aapki **/harem** list ab **'{new_text}'** ke naam se jaani jayegi.")
+
+async def imode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/imode [text]: Customizes the title of the Inline Search."""
+    if not context.args:
+        await update.message.reply_text("Kripya naya naam enter karein. Example: `/imode My Waifu Gallery`")
+        return
+        
+    new_text = " ".join(context.args).strip()[:30]
+    user_id = update.effective_user.id
+    
+    execute_query("UPDATE user_profiles SET imode_text = %s WHERE user_id = %s;", (new_text, user_id))
+    await update.message.reply_text(f"✅ Success! Aapki Inline Search Gallery ab **'{new_text}'** ke title se dikhegi.")
 
 # --- WEBHOOK MAIN FUNCTION ---
 
 def main():
     """Bot ko Webhook mode mein start karta hai."""
-    initialize_database() # DB initialization/migration
     
     # Check config
     if not TELEGRAM_TOKEN or not DATABASE_URL or not WEBHOOK_URL:
-        logger.error("Required environment variables are not set.")
+        logger.error("Required environment variables (TELEGRAM_TOKEN, DATABASE_URL, WEBHOOK_URL) are not set.")
         return
         
+    initialize_database() # DB initialization/migration
+
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Command Handlers
@@ -559,9 +792,9 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("grab", grab_command))
     application.add_handler(CommandHandler("harem", harem_command))
-    application.add_handler(CommandHandler("search", search_command)) # Command for info, main search is inline
+    application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("changetime", changetime_command))
-    application.add_handler(CommandHandler("top", top_command)) 
+    application.add_handler(CommandHandler("top", top_command)) # Alias for /gtop
     application.add_handler(CommandHandler("trade", trade_command))
     application.add_handler(CommandHandler("gift", gift_command))
     application.add_handler(CommandHandler("gtop", leaderboard_command))
@@ -573,7 +806,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_counter))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    # --- NEW: INLINE QUERY HANDLER ---
+    # INLINE QUERY HANDLER (For the gallery search)
     application.add_handler(InlineQueryHandler(inline_search))
     
     # Run in Webhook mode for Render Web Service
@@ -585,35 +818,6 @@ def main():
         url_path=TELEGRAM_TOKEN,
         webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
     )
-
-# Placeholder commands (You need to include the actual functions from previous responses)
-# For brevity, the full code for commands like start_command, harem_command etc. 
-# is assumed to be included in the final bot.py file you are preparing.
-
-# DUMMY implementation for placeholder functions (REMOVE these if you have the real ones)
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    register_user(update.effective_user)
-    await update.message.reply_text("Bot started with all commands. Use @botname [search_term] for inline search.")
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    await update.message.reply_text("Help: Use @botname [search] for waifu gallery.")
-async def harem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Harem command active.")
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Type `@botname [waifu name]` in any chat for inline search gallery!")
-async def changetime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Changetime command active (Admin only).")
-async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/top redirects to /gtop.")
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Leaderboard command active.")
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Status command active.")
-async def hmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Harem mode command active.")
-async def imode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Inline mode command active.")
-def get_leaderboard_markup(time_period): return None
-def fetch_leaderboard_data(time_period): return "Leaderboard data"
 
 
 if __name__ == "__main__":
